@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🎯 KGS Local API Server - ALL ENDPOINTS (Render Deploy Ready)
+🎯 KGS Local API Server - ALL ENDPOINTS (Railway/Render Deploy Ready)
 📡 Working Endpoints:
    • GET /api/batches                    → All batches list
    • GET /api/batch-meta/<id>            → Batch metadata
@@ -13,8 +13,9 @@
    • GET /api/lesson/<lesson_id>         → Lesson details (videos/PDFs)
    • GET /api/video/<video_id>           → Video details
 ✅ Handles: zstd compression + sunny-keys seeding + cookie auth + caching
+✅ Better error handling: 404/401/empty data responses
 🔇 Silent mode: No VS Code side-panel clutter
-🚀 Render Compatible: host=0.0.0.0 + PORT env var support
+🚀 Deploy Compatible: host=0.0.0.0 + PORT env var support
 """
 
 from flask import Flask, jsonify, request, Response
@@ -70,6 +71,19 @@ def _log(msg):
         print(f"[API] {msg}", file=sys.stderr)
 
 
+def _is_valid_response(data):
+    """Check if remote API returned meaningful data"""
+    if data is None:
+        return False
+    if isinstance(data, dict) and len(data) == 0:
+        return False  # Empty {}
+    if isinstance(data, list) and len(data) == 0:
+        return False  # Empty []
+    if isinstance(data, dict) and data.get("error"):
+        return False  # Remote API ne error bheja
+    return True
+
+
 def decompress_zstd(raw_bytes):
     """Decompress zstd-encoded response"""
     try:
@@ -100,7 +114,7 @@ def seed_sunny_keys(session, path, method="GET"):
 
 
 def _fetch_remote(endpoint_path, param_id=None):
-    """Fetch data from remote API with compression handling"""
+    """Fetch data from remote API with BETTER error handling"""
     session = requests.Session()
     session.cookies.update(COOKIES)
     
@@ -114,6 +128,19 @@ def _fetch_remote(endpoint_path, param_id=None):
         _log(f"Fetching: {api_url}")
         resp = session.get(api_url, headers=HEADERS, timeout=30)
         
+        # 🔍 Debug: Log raw response if DEBUG_API=1
+        if os.environ.get("DEBUG_API"):
+            _log(f"Status: {resp.status_code} | Headers: {dict(resp.headers)}")
+            _log(f"Raw content (first 200 chars): {resp.content[:200]}")
+        
+        if resp.status_code == 404:
+            _log(f"Remote 404: {api_url}")
+            return {"error": "Batch/Resource not found", "batch_id": param_id}
+        
+        if resp.status_code == 403:
+            _log(f"Remote 403 (auth failed): {api_url}")
+            return {"error": "Authentication failed - cookies expired", "batch_id": param_id}
+        
         if resp.status_code != 200:
             _log(f"Remote fetch failed: {resp.status_code}")
             return None
@@ -125,15 +152,39 @@ def _fetch_remote(endpoint_path, param_id=None):
             decompressed = decompress_zstd(raw)
             if decompressed:
                 raw = decompressed
+            else:
+                _log(f"Zstd decompress failed, trying raw JSON")
         elif encoding in ['gzip', 'deflate']:
             import zlib
-            raw = zlib.decompress(raw, 16+zlib.MAX_WBITS if encoding=='gzip' else -zlib.MAX_WBITS)
+            try:
+                raw = zlib.decompress(raw, 16+zlib.MAX_WBITS if encoding=='gzip' else -zlib.MAX_WBITS)
+            except:
+                pass
         
-        return json.loads(raw.decode('utf-8'))
+        # 🔍 Parse JSON with error handling
+        try:
+            data = json.loads(raw.decode('utf-8'))
+        except json.JSONDecodeError as e:
+            _log(f"JSON parse error: {e}")
+            _log(f"Raw response: {raw[:500]}")
+            return {"error": "Invalid response from remote API", "batch_id": param_id}
         
+        # ✅ Check if response has meaningful data
+        if not _is_valid_response(data):
+            _log(f"Remote returned empty/invalid data for {full_path}")
+            return {"error": "No data available for this batch", "batch_id": param_id, "note": "This batch may not have classroom/lessons data"}
+        
+        return data
+        
+    except requests.exceptions.Timeout:
+        _log(f"Timeout fetching: {api_url}")
+        return {"error": "Remote API timeout", "batch_id": param_id}
+    except requests.exceptions.ConnectionError:
+        _log(f"Connection error fetching: {api_url}")
+        return {"error": "Could not connect to remote API", "batch_id": param_id}
     except Exception as e:
-        _log(f"Fetch error: {e}")
-        return None
+        _log(f"Fetch error: {type(e).__name__}: {e}")
+        return {"error": f"Internal error: {str(e)}", "batch_id": param_id}
 
 
 def _get_cached(endpoint_path, param_id=None, force=False):
@@ -195,6 +246,16 @@ def api_batch_meta(batch_id):
     data = _get_cached('/api/batch-meta', batch_id)
     if data is None:
         return jsonify({"error": f"Failed to fetch batch-meta for {batch_id}"}), 502
+    
+    # Handle specific error responses
+    if isinstance(data, dict) and data.get("error"):
+        if "not found" in data["error"].lower():
+            return jsonify(data), 404
+        if "authentication" in data["error"].lower():
+            return jsonify(data), 401
+        if "no data" in data["error"].lower():
+            return jsonify(data), 404
+    
     return jsonify(data)
 
 
@@ -203,6 +264,15 @@ def api_today(batch_id):
     data = _get_cached('/api/today', batch_id)
     if data is None:
         return jsonify({"error": f"Failed to fetch today's classes for batch {batch_id}"}), 502
+    
+    if isinstance(data, dict) and data.get("error"):
+        if "not found" in data["error"].lower():
+            return jsonify(data), 404
+        if "authentication" in data["error"].lower():
+            return jsonify(data), 401
+        if "no data" in data["error"].lower():
+            return jsonify(data), 404
+    
     return jsonify(data)
 
 
@@ -211,6 +281,15 @@ def api_classroom(batch_id):
     data = _get_cached('/api/classroom', batch_id)
     if data is None:
         return jsonify({"error": f"Failed to fetch classroom for batch {batch_id}"}), 502
+    
+    if isinstance(data, dict) and data.get("error"):
+        if "not found" in data["error"].lower():
+            return jsonify(data), 404
+        if "authentication" in data["error"].lower():
+            return jsonify(data), 401
+        if "no data" in data["error"].lower():
+            return jsonify(data), 404
+    
     return jsonify(data)
 
 
@@ -219,6 +298,15 @@ def api_updates(batch_id):
     data = _get_cached('/api/updates', batch_id)
     if data is None:
         return jsonify({"error": f"Failed to fetch updates for batch {batch_id}"}), 502
+    
+    if isinstance(data, dict) and data.get("error"):
+        if "not found" in data["error"].lower():
+            return jsonify(data), 404
+        if "authentication" in data["error"].lower():
+            return jsonify(data), 401
+        if "no data" in data["error"].lower():
+            return jsonify(data), 404
+    
     return jsonify(data)
 
 
@@ -227,6 +315,15 @@ def api_timetable(batch_id):
     data = _get_cached('/api/timetable', batch_id)
     if data is None:
         return jsonify({"error": f"Failed to fetch timetable for batch {batch_id}"}), 502
+    
+    if isinstance(data, dict) and data.get("error"):
+        if "not found" in data["error"].lower():
+            return jsonify(data), 404
+        if "authentication" in data["error"].lower():
+            return jsonify(data), 401
+        if "no data" in data["error"].lower():
+            return jsonify(data), 404
+    
     return jsonify(data)
 
 
@@ -235,6 +332,15 @@ def api_test_series(batch_id):
     data = _get_cached('/api/batch-test-series', batch_id)
     if data is None:
         return jsonify({"error": f"Failed to fetch test-series for batch {batch_id}"}), 502
+    
+    if isinstance(data, dict) and data.get("error"):
+        if "not found" in data["error"].lower():
+            return jsonify(data), 404
+        if "authentication" in data["error"].lower():
+            return jsonify(data), 401
+        if "no data" in data["error"].lower():
+            return jsonify(data), 404
+    
     return jsonify(data)
 
 
@@ -243,6 +349,15 @@ def api_lesson(lesson_id):
     data = _get_cached('/api/lesson', lesson_id)
     if data is None:
         return jsonify({"error": f"Failed to fetch lesson {lesson_id}"}), 502
+    
+    if isinstance(data, dict) and data.get("error"):
+        if "not found" in data["error"].lower():
+            return jsonify(data), 404
+        if "authentication" in data["error"].lower():
+            return jsonify(data), 401
+        if "no data" in data["error"].lower():
+            return jsonify(data), 404
+    
     return jsonify(data)
 
 
@@ -251,6 +366,15 @@ def api_video(video_id):
     data = _get_cached('/api/video', video_id)
     if data is None:
         return jsonify({"error": f"Failed to fetch video {video_id}"}), 502
+    
+    if isinstance(data, dict) and data.get("error"):
+        if "not found" in data["error"].lower():
+            return jsonify(data), 404
+        if "authentication" in data["error"].lower():
+            return jsonify(data), 401
+        if "no data" in data["error"].lower():
+            return jsonify(data), 404
+    
     return jsonify(data)
 
 
@@ -273,7 +397,8 @@ def health():
         ],
         "cache_dir": OUTPUT_DIR,
         "cache_ttl_seconds": CACHE_TTL,
-        "deploy": "render-ready"
+        "deploy": "railway-ready",
+        "debug_mode": bool(os.environ.get("DEBUG_API"))
     })
 
 
@@ -316,9 +441,9 @@ if __name__ == '__main__':
     # Pre-warm cache
     _get_cached('/api/batches')
     
-    # Render compatible startup
+    # Deploy compatible startup
     _print_startup()
     
-    # 🚀 Render requires host='0.0.0.0' and PORT from env
+    # 🚀 Railway/Render requires host='0.0.0.0' and PORT from env
     port = int(os.environ.get("PORT", 8000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
